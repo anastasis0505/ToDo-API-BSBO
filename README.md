@@ -27,3 +27,10 @@ API для управления задачами с использованием
 
 ### Поиск
 - `GET /tasks/search?q={query}` - Поиск по названию/описанию
+
+## Запуск проекта
+
+1. Клонировать репозиторий:
+   ```bash
+   git clone https://github.com/anastasis0505/ToDo-API-BSBO.git
+   cd ToDo-API-BSBO
