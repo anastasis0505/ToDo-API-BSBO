@@ -1,19 +1,32 @@
-# routers/tasks.py
-from fastapi import APIRouter, HTTPException, Response, status, Query
+from fastapi import APIRouter, HTTPException, Depends, Query, status
 from typing import List, Optional
-from datetime import datetime
+from datetime import datetime, date
+from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy import select
 
 from schemas import TaskCreate, TaskUpdate, TaskResponse
-from database import tasks_db
+from models import Task
+from database import get_async_session
 
 router = APIRouter(
-    prefix="/tasks",  # ДОБАВЛЯЕМ ПРЕФИКС здесь!
+    prefix="/tasks",
     tags=["tasks"],
     responses={404: {"description": "Task not found"}},
 )
 
-# Вспомогательная функция для определения квадранта
-def determine_quadrant(is_important: bool, is_urgent: bool) -> str:
+# ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ
+def calculate_urgency(deadline: Optional[date]) -> bool:
+    """Определяет срочность: True если до дедлайна <= 3 дня"""
+    if not deadline:
+        return False
+    today = date.today()
+    days_left = (deadline - today).days
+    return days_left <= 3
+
+def determine_quadrant(is_important: bool, deadline: Optional[date]) -> str:
+    """Определяет квадрант на основе важности и дедлайна"""
+    is_urgent = calculate_urgency(deadline)
+    
     if is_important and is_urgent:
         return "Q1"
     elif is_important and not is_urgent:
@@ -23,177 +36,184 @@ def determine_quadrant(is_important: bool, is_urgent: bool) -> str:
     else:
         return "Q4"
 
-# GET все задачи
+def calculate_days_until_deadline(deadline: Optional[date]) -> Optional[int]:
+    """Рассчитывает дни до дедлайна"""
+    if not deadline:
+        return None
+    today = date.today()
+    return (deadline - today).days
+
+def task_to_response(task: Task) -> TaskResponse:
+    """Конвертирует SQLAlchemy модель в Pydantic схему"""
+    return TaskResponse(
+        id=task.id,
+        title=task.title,
+        description=task.description,
+        is_important=task.is_important,
+        deadline_at=task.deadline_at,
+        days_until_deadline=calculate_days_until_deadline(task.deadline_at),
+        quadrant=task.quadrant,
+        completed=task.completed,
+        created_at=task.created_at,
+        completed_at=task.completed_at
+    )
+
+# GET ВСЕ ЗАДАЧИ
 @router.get("/", response_model=List[TaskResponse])
-async def get_all_tasks():
-    """
-    Получить все задачи
-    """
-    return tasks_db
+async def get_all_tasks(db: AsyncSession = Depends(get_async_session)):
+    result = await db.execute(select(Task))
+    tasks = result.scalars().all()
+    return [task_to_response(task) for task in tasks]
 
-# GET задача по ID
-@router.get("/{task_id}", response_model=TaskResponse)
-async def get_task_by_id(task_id: int):
-    """
-    Получить задачу по ID
-    """
-    task = next((t for t in tasks_db if t["id"] == task_id), None)
-    if not task:
-        raise HTTPException(
-            status_code=404,
-            detail=f"Задача с ID {task_id} не найдена"
-        )
-    return task
-
-# POST создание задачи
-@router.post("/", response_model=TaskResponse, status_code=status.HTTP_201_CREATED)
-async def create_task(task: TaskCreate):
-    """
-    Создать новую задачу
-    """
-    # Определяем квадрант
-    quadrant = determine_quadrant(task.is_important, task.is_urgent)
-    
-    # Генерируем новый ID
-    new_id = max([t["id"] for t in tasks_db], default=0) + 1
-    
-    # Создаём новую задачу
-    new_task = {
-        "id": new_id,
-        "title": task.title,
-        "description": task.description,
-        "is_important": task.is_important,
-        "is_urgent": task.is_urgent,
-        "quadrant": quadrant,
-        "completed": False,
-        "created_at": datetime.now(),
-        "completed_at": None
-    }
-    
-    # Добавляем в "базу данных"
-    tasks_db.append(new_task)
-    
-    return new_task
-
-# PUT обновление задачи
-@router.put("/{task_id}", response_model=TaskResponse)
-async def update_task(task_id: int, task_update: TaskUpdate):
-    """
-    Обновить задачу
-    """
-    # Ищем задачу по ID
-    task = next((t for t in tasks_db if t["id"] == task_id), None)
-    
-    if not task:
-        raise HTTPException(
-            status_code=404,
-            detail=f"Задача с ID {task_id} не найдена"
-        )
-    
-    # Получаем только переданные поля
-    update_data = task_update.model_dump(exclude_unset=True)
-    
-    # Обновляем поля
-    for field, value in update_data.items():
-        task[field] = value
-    
-    # Пересчитываем квадрант, если изменились важность или срочность
-    if "is_important" in update_data or "is_urgent" in update_data:
-        task["quadrant"] = determine_quadrant(
-            task.get("is_important", False),
-            task.get("is_urgent", False)
-        )
-    
-    return task
-
-# PATCH отметка задачи как выполненной
-@router.patch("/{task_id}/complete", response_model=TaskResponse)
-async def complete_task(task_id: int):
-    """
-    Отметить задачу как выполненную
-    """
-    # Ищем задачу по ID
-    task = next((t for t in tasks_db if t["id"] == task_id), None)
-    
-    if not task:
-        raise HTTPException(
-            status_code=404,
-            detail=f"Задача с ID {task_id} не найдена"
-        )
-    
-    # Обновляем статус
-    task["completed"] = True
-    task["completed_at"] = datetime.now()
-    
-    return task
-
-# DELETE удаление задачи
-@router.delete("/{task_id}", status_code=status.HTTP_204_NO_CONTENT)
-async def delete_task(task_id: int):
-    """
-    Удалить задачу
-    """
-    # Ищем задачу по ID
-    task = next((t for t in tasks_db if t["id"] == task_id), None)
-    
-    if not task:
-        raise HTTPException(
-            status_code=404,
-            detail=f"Задача с ID {task_id} не найдена"
-        )
-    
-    # Удаляем задачу
-    tasks_db.remove(task)
-    
-    return Response(status_code=status.HTTP_204_NO_CONTENT)
-
-# GET задачи по квадранту
+# GET ЗАДАЧИ ПО КВАДРАНТУ
 @router.get("/quadrant/{quadrant}", response_model=List[TaskResponse])
-async def get_tasks_by_quadrant(quadrant: str):
-    """
-    Получить задачи по квадранту
-    """
+async def get_tasks_by_quadrant(
+    quadrant: str,
+    db: AsyncSession = Depends(get_async_session)
+):
     if quadrant not in ["Q1", "Q2", "Q3", "Q4"]:
-        raise HTTPException(
-            status_code=400,
-            detail="Неверный квадрант. Используйте: Q1, Q2, Q3, Q4"
-        )
+        raise HTTPException(status_code=400, detail="Неверный квадрант. Используйте: Q1, Q2, Q3, Q4")
     
-    filtered_tasks = [task for task in tasks_db if task["quadrant"] == quadrant]
-    return filtered_tasks
+    result = await db.execute(select(Task).where(Task.quadrant == quadrant))
+    tasks = result.scalars().all()
+    return [task_to_response(task) for task in tasks]
 
-# GET задачи по статусу
-@router.get("/status/{status}", response_model=List[TaskResponse])
-async def get_tasks_by_status(status: str):
-    """
-    Получить задачи по статусу
-    """
-    if status not in ["completed", "pending"]:
-        raise HTTPException(
-            status_code=400,
-            detail="Неверный статус. Используйте: completed или pending"
+# ПОИСК ЗАДАЧ
+@router.get("/search", response_model=List[TaskResponse])
+async def search_tasks(
+    q: str = Query(..., min_length=2),
+    db: AsyncSession = Depends(get_async_session)
+):
+    keyword = f"%{q.lower()}%"
+    result = await db.execute(
+        select(Task).where(
+            (Task.title.ilike(keyword)) |
+            (Task.description.ilike(keyword))
         )
+    )
+    tasks = result.scalars().all()
+    
+    if not tasks:
+        raise HTTPException(status_code=404, detail="По данному запросу ничего не найдено")
+    
+    return [task_to_response(task) for task in tasks]
+
+# GET ЗАДАЧИ ПО СТАТУСУ
+@router.get("/status/{status}", response_model=List[TaskResponse])
+async def get_tasks_by_status(
+    status: str,
+    db: AsyncSession = Depends(get_async_session)
+):
+    if status not in ["completed", "pending"]:
+        raise HTTPException(status_code=400, detail="Недопустимый статус. Используйте: completed или pending")
     
     is_completed = (status == "completed")
-    filtered_tasks = [task for task in tasks_db if task["completed"] == is_completed]
-    return filtered_tasks
+    result = await db.execute(select(Task).where(Task.completed == is_completed))
+    tasks = result.scalars().all()
+    return [task_to_response(task) for task in tasks]
 
-# GET поиск задач
-@router.get("/search", response_model=List[TaskResponse])
-async def search_tasks(q: str = Query(..., min_length=1, description="Поисковый запрос")):
-    """
-    Поиск задач
-    """
-    search_results = []
-    for task in tasks_db:
-        if (q.lower() in task["title"].lower() or 
-            (task["description"] and q.lower() in task["description"].lower())):
-            search_results.append(task)
+# GET ЗАДАЧА ПО ID
+@router.get("/{task_id}", response_model=TaskResponse)
+async def get_task_by_id(
+    task_id: int,
+    db: AsyncSession = Depends(get_async_session)
+):
+    result = await db.execute(select(Task).where(Task.id == task_id))
+    task = result.scalar_one_or_none()
     
-    if not search_results:
-        raise HTTPException(
-            status_code=404,
-            detail=f"Задачи по запросу '{q}' не найдены"
-        )
+    if not task:
+        raise HTTPException(status_code=404, detail="Задача не найдена")
     
-    return search_results
+    return task_to_response(task)
+
+# POST - СОЗДАНИЕ НОВОЙ ЗАДАЧИ
+@router.post("/", response_model=TaskResponse, status_code=status.HTTP_201_CREATED)
+async def create_task(
+    task: TaskCreate,
+    db: AsyncSession = Depends(get_async_session)
+):
+    # Определяем квадрант на основе важности и дедлайна
+    quadrant = determine_quadrant(task.is_important, task.deadline_at)
+    
+    new_task = Task(
+        title=task.title,
+        description=task.description,
+        is_important=task.is_important,
+        deadline_at=task.deadline_at,
+        quadrant=quadrant,
+        completed=False
+    )
+    
+    db.add(new_task)
+    await db.commit()
+    await db.refresh(new_task)
+    
+    return task_to_response(new_task)
+
+# PUT - ОБНОВЛЕНИЕ ЗАДАЧИ
+@router.put("/{task_id}", response_model=TaskResponse)
+async def update_task(
+    task_id: int,
+    task_update: TaskUpdate,
+    db: AsyncSession = Depends(get_async_session)
+):
+    # Находим задачу
+    result = await db.execute(select(Task).where(Task.id == task_id))
+    task = result.scalar_one_or_none()
+    
+    if not task:
+        raise HTTPException(status_code=404, detail="Задача не найдена")
+    
+    # Обновляем только переданные поля
+    update_data = task_update.model_dump(exclude_unset=True)
+    for field, value in update_data.items():
+        setattr(task, field, value)
+    
+    # Пересчитываем квадрант если изменилась важность или дедлайн
+    if "is_important" in update_data or "deadline_at" in update_data:
+        task.quadrant = determine_quadrant(task.is_important, task.deadline_at)
+    
+    await db.commit()
+    await db.refresh(task)
+    
+    return task_to_response(task)
+
+# PATCH - ОТМЕТИТЬ ЗАДАЧУ ВЫПОЛНЕННОЙ
+@router.patch("/{task_id}/complete", response_model=TaskResponse)
+async def complete_task(
+    task_id: int,
+    db: AsyncSession = Depends(get_async_session)
+):
+    result = await db.execute(select(Task).where(Task.id == task_id))
+    task = result.scalar_one_or_none()
+    
+    if not task:
+        raise HTTPException(status_code=404, detail="Задача не найдена")
+    
+    task.completed = True
+    task.completed_at = datetime.now()
+    
+    await db.commit()
+    await db.refresh(task)
+    
+    return task_to_response(task)
+
+# DELETE - УДАЛЕНИЕ ЗАДАЧИ
+@router.delete("/{task_id}", status_code=status.HTTP_200_OK)
+async def delete_task(
+    task_id: int,
+    db: AsyncSession = Depends(get_async_session)
+):
+    result = await db.execute(select(Task).where(Task.id == task_id))
+    task = result.scalar_one_or_none()
+    
+    if not task:
+        raise HTTPException(status_code=404, detail="Задача не найдена")
+    
+    await db.delete(task)
+    await db.commit()
+    
+    return {
+        "message": "Задача успешно удалена",
+        "id": task_id
+    }
