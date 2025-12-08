@@ -2,60 +2,62 @@ from fastapi import APIRouter, HTTPException, Depends, Query, status
 from typing import List, Optional
 from datetime import datetime, date
 from sqlalchemy.ext.asyncio import AsyncSession
-from sqlalchemy import select
+from sqlalchemy import select, func, case
 
 from schemas import TaskCreate, TaskUpdate, TaskResponse
 from models import Task
 from database import get_async_session
+from utils import calculate_urgency, calculate_days_until_deadline, determine_quadrant
 
 router = APIRouter(
-    prefix="/tasks",
     tags=["tasks"],
     responses={404: {"description": "Task not found"}},
 )
 
-# ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ
-def calculate_urgency(deadline: Optional[date]) -> bool:
-    """Определяет срочность: True если до дедлайна <= 3 дня"""
-    if not deadline:
-        return False
-    today = date.today()
-    days_left = (deadline - today).days
-    return days_left <= 3
-
-def determine_quadrant(is_important: bool, deadline: Optional[date]) -> str:
-    """Определяет квадрант на основе важности и дедлайна"""
-    is_urgent = calculate_urgency(deadline)
-    
-    if is_important and is_urgent:
-        return "Q1"
-    elif is_important and not is_urgent:
-        return "Q2"
-    elif not is_important and is_urgent:
-        return "Q3"
-    else:
-        return "Q4"
-
-def calculate_days_until_deadline(deadline: Optional[date]) -> Optional[int]:
-    """Рассчитывает дни до дедлайна"""
-    if not deadline:
-        return None
-    today = date.today()
-    return (deadline - today).days
-
 def task_to_response(task: Task) -> TaskResponse:
     """Конвертирует SQLAlchemy модель в Pydantic схему"""
+    days_left = calculate_days_until_deadline(task.deadline_at)
+    
+    # Определяем статус сообщения на основе сроков и выполнения
+    status_message = None
+    
+    if task.completed:
+        # Задача выполнена
+        if task.completed_at and task.deadline_at:
+            # Есть дата выполнения и дедлайн
+            if task.completed_at.date() <= task.deadline_at:
+                status_message = "Выполнено в срок"
+            else:
+                status_message = "Выполнено с опозданием"
+        else:
+            # Нет данных для сравнения
+            status_message = "Выполнено"
+    else:
+        # Задача не выполнена
+        if days_left is not None:
+            if days_left < 0:
+                status_message = "Просрочена"
+            elif days_left == 0:
+                status_message = "Срок истекает сегодня"
+            elif days_left <= 3:
+                status_message = "Срочно"
+            else:
+                status_message = "В плане"
+        else:
+            status_message = "Без срока"
+    
     return TaskResponse(
         id=task.id,
         title=task.title,
         description=task.description,
         is_important=task.is_important,
         deadline_at=task.deadline_at,
-        days_until_deadline=calculate_days_until_deadline(task.deadline_at),
+        days_until_deadline=days_left,
         quadrant=task.quadrant,
         completed=task.completed,
         created_at=task.created_at,
-        completed_at=task.completed_at
+        completed_at=task.completed_at,
+        status_message=status_message
     )
 
 # GET ВСЕ ЗАДАЧИ
@@ -132,13 +134,17 @@ async def create_task(
     task: TaskCreate,
     db: AsyncSession = Depends(get_async_session)
 ):
-    # Определяем квадрант на основе важности и дедлайна
+    # Определяем срочность на основе дедлайна
+    is_urgent = calculate_urgency(task.deadline_at)
+    
+    # Определяем квадрант
     quadrant = determine_quadrant(task.is_important, task.deadline_at)
     
     new_task = Task(
         title=task.title,
         description=task.description,
         is_important=task.is_important,
+        is_urgent=is_urgent,  # Сохраняем вычисленную срочность
         deadline_at=task.deadline_at,
         quadrant=quadrant,
         completed=False
@@ -169,8 +175,9 @@ async def update_task(
     for field, value in update_data.items():
         setattr(task, field, value)
     
-    # Пересчитываем квадрант если изменилась важность или дедлайн
+    # Пересчитываем срочность и квадрант если изменилась важность или дедлайн
     if "is_important" in update_data or "deadline_at" in update_data:
+        task.is_urgent = calculate_urgency(task.deadline_at)
         task.quadrant = determine_quadrant(task.is_important, task.deadline_at)
     
     await db.commit()
@@ -217,3 +224,19 @@ async def delete_task(
         "message": "Задача успешно удалена",
         "id": task_id
     }
+
+# НОВЫЙ ЭНДПОИНТ: задачи, срок которых истекает сегодня
+@router.get("/today", response_model=List[TaskResponse])
+async def get_tasks_due_today(db: AsyncSession = Depends(get_async_session)):
+    """Получить задачи, срок выполнения которых истекает сегодня"""
+    today = date.today()
+    
+    result = await db.execute(
+        select(Task).where(
+            Task.deadline_at == today,
+            Task.completed == False
+        )
+    )
+    tasks = result.scalars().all()
+    
+    return [task_to_response(task) for task in tasks]
