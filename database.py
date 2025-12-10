@@ -28,12 +28,12 @@ AsyncSessionLocal = async_sessionmaker(
 async def init_db():
     async with engine.begin() as conn:
         await conn.run_sync(Base.metadata.create_all)
-    print("Database initialized!")
+    print("База данных инициализирована!")
 
 async def drop_db():
     async with engine.begin() as conn:
         await conn.run_sync(Base.metadata.drop_all)
-    print("All tables deleted!")
+    print("Все таблицы удалены!")
 
 async def get_async_session() -> AsyncGenerator[AsyncSession, None]:
     async with AsyncSessionLocal() as session:
